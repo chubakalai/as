@@ -1,4 +1,4 @@
-app = "equitym"
+app = "as"
 primary_region = "iad"
 
 [build]
