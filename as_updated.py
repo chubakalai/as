@@ -605,10 +605,15 @@ def build_equity_chart_svg(
     Render a square (1:1) SVG line chart of equity over time.
 
     The x-axis marks every UTC hour boundary with a bare hour-of-day
-    number (00-23), except at the boundary where a new UTC calendar
-    day begins (i.e., where the label would otherwise read "00"),
-    which is instead labeled with the day and month of that new day
-    in dd.mm format (e.g., "10.09").
+    number (00-23). At the specific hour mark where a new UTC calendar
+    day begins, the "00" label is followed by a second line beneath it
+    showing the day and month of that new day in dd.mm format
+    (e.g., "10.09"). All other hour marks show only their single-line
+    hh label, unchanged.
+
+    Dashed reference/gridlines (both the horizontal min/max lines and
+    the vertical per-hour gridlines) have been removed; only the solid
+    axis lines, solid tick marks, and text labels remain.
     """
 
     if len(series) < 2:
@@ -665,16 +670,10 @@ def build_equity_chart_svg(
         f'x2="{plot_left}" y2="{plot_bottom}" '
         'stroke="#333333" stroke-width="1.5" />',
 
-        f'<line x1="{plot_left}" y1="{plot_top}" '
-        f'x2="{plot_right}" y2="{plot_top}" '
-        'stroke="#dddddd" stroke-width="1" stroke-dasharray="4,3" />',
         f'<text x="{plot_left - 8}" y="{plot_top + 4}" '
         'text-anchor="end" font-size="12" font-family="monospace" '
         f'fill="#333333">{format_number(max_equity)}</text>',
 
-        f'<line x1="{plot_left}" y1="{plot_bottom}" '
-        f'x2="{plot_right}" y2="{plot_bottom}" '
-        'stroke="#dddddd" stroke-width="1" stroke-dasharray="4,3" />',
         f'<text x="{plot_left - 8}" y="{plot_bottom + 4}" '
         'text-anchor="end" font-size="12" font-family="monospace" '
         f'fill="#333333">{format_number(min_equity)}</text>',
@@ -702,29 +701,37 @@ def build_equity_chart_svg(
 
         mark_dt = utc_dt(hour_mark)
 
-        if mark_dt.hour == 0:
-            # New UTC calendar day: label with dd.mm instead of "00".
-            label = mark_dt.strftime("%d.%m")
-        else:
-            label = f"{mark_dt.hour:02d}"
-
-        x_axis_elements.append(
-            f'<line x1="{x:.2f}" y1="{plot_top}" '
-            f'x2="{x:.2f}" y2="{plot_bottom}" '
-            'stroke="#eeeeee" stroke-width="1" stroke-dasharray="4,3" />'
-        )
-
         x_axis_elements.append(
             f'<line x1="{x:.2f}" y1="{plot_bottom}" '
             f'x2="{x:.2f}" y2="{plot_bottom + 6}" '
             'stroke="#333333" stroke-width="1.5" />'
         )
 
-        x_axis_elements.append(
-            f'<text x="{x:.2f}" y="{plot_bottom + 20}" '
-            'text-anchor="middle" font-size="11" font-family="monospace" '
-            f'fill="#333333">{label}</text>'
-        )
+        if mark_dt.hour == 0:
+            # New UTC calendar day: show "00" with the date on a
+            # second line beneath it.
+            date_label = mark_dt.strftime("%d.%m")
+
+            x_axis_elements.append(
+                f'<text x="{x:.2f}" y="{plot_bottom + 20}" '
+                'text-anchor="middle" font-size="11" '
+                'font-family="monospace" fill="#333333">00</text>'
+            )
+
+            x_axis_elements.append(
+                f'<text x="{x:.2f}" y="{plot_bottom + 33}" '
+                'text-anchor="middle" font-size="11" '
+                f'font-family="monospace" fill="#333333">{date_label}</text>'
+            )
+
+        else:
+            label = f"{mark_dt.hour:02d}"
+
+            x_axis_elements.append(
+                f'<text x="{x:.2f}" y="{plot_bottom + 20}" '
+                'text-anchor="middle" font-size="11" '
+                f'font-family="monospace" fill="#333333">{label}</text>'
+            )
 
         hour_mark += seconds_per_hour
 
