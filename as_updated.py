@@ -7,7 +7,7 @@ import os
 import threading
 import time
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -38,6 +38,9 @@ CHART_MARGIN_BOTTOM = 60
 # Drawdown chart bar-geometry configuration
 DRAWDOWN_MIN_SCOPE_DAYS = 30
 DRAWDOWN_BARS_PER_SCOPE = 30
+
+# Rolling drawdown window
+ROLLING_WINDOW_SECONDS = 86400
 
 # VAR alert configuration
 VAR_THRESHOLD_PCT = 62.0
@@ -121,6 +124,27 @@ debug_lock = threading.Lock()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# UTC HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def utc_dt(timeslot: float) -> datetime:
+    """Convert a Unix timestamp to a timezone-aware UTC datetime."""
+    return datetime.fromtimestamp(timeslot, tz=timezone.utc)
+
+
+def utc_midnight(timeslot: float) -> int:
+    """Return the Unix timestamp of the UTC midnight on or before timeslot."""
+    dt = utc_dt(timeslot)
+    midnight = datetime(
+        dt.year,
+        dt.month,
+        dt.day,
+        tzinfo=timezone.utc,
+    )
+    return int(midnight.timestamp())
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # HISTORY MANAGEMENT
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -165,9 +189,7 @@ def save_to_history(
 
     record = {
         "timeslot": timeslot,
-        "datetime": datetime.fromtimestamp(
-            timeslot
-        ).isoformat(),
+        "datetime": utc_dt(timeslot).isoformat(),
         "raw_response": raw_response,
     }
 
@@ -432,11 +454,9 @@ def build_headline(
         "positionMargin",
     )
 
-    last_updated = datetime.fromtimestamp(
-        current_time
-    ).strftime(
+    last_updated = utc_dt(current_time).strftime(
         "%Y-%m-%d %H:%M:%S"
-    )
+    ) + " UTC"
 
     return (
         f"Last Updated: {last_updated}\n"
@@ -583,6 +603,12 @@ def build_equity_chart_svg(
 ) -> str:
     """
     Render a square (1:1) SVG line chart of equity over time.
+
+    The x-axis marks every UTC hour boundary with a bare hour-of-day
+    number (00-23), except at the boundary where a new UTC calendar
+    day begins (i.e., where the label would otherwise read "00"),
+    which is instead labeled with the day and month of that new day
+    in dd.mm format (e.g., "10.09").
     """
 
     if len(series) < 2:
@@ -674,13 +700,13 @@ def build_equity_chart_svg(
     while hour_mark <= max_time:
         x = x_for(hour_mark)
 
-        label = str(
-            int(
-                datetime.fromtimestamp(
-                    hour_mark
-                ).strftime("%H")
-            )
-        )
+        mark_dt = utc_dt(hour_mark)
+
+        if mark_dt.hour == 0:
+            # New UTC calendar day: label with dd.mm instead of "00".
+            label = mark_dt.strftime("%d.%m")
+        else:
+            label = f"{mark_dt.hour:02d}"
 
         x_axis_elements.append(
             f'<line x1="{x:.2f}" y1="{plot_top}" '
@@ -717,7 +743,7 @@ def build_equity_chart_svg(
 
         f'<text x="{size / 2:.2f}" y="18" text-anchor="middle" '
         'font-size="14" font-family="monospace" font-weight="bold" '
-        'fill="#111111">Equity Over Time</text>',
+        'fill="#111111">Equity Over Time (UTC)</text>',
 
         *y_axis_elements,
         *x_axis_elements,
@@ -734,19 +760,19 @@ def build_equity_chart_svg(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DRAWDOWN EXTRACTION
+# ROLLING DRAWDOWN EXTRACTION
 # ─────────────────────────────────────────────────────────────────────────────
 
-def extract_daily_drawdowns(
+def extract_rolling_drawdowns(
     series: List[Tuple[int, float, float]],
 ) -> List[Tuple[int, float]]:
     """
-    Group 15-minute data by calendar day and calculate the maximum
-    intraday drawdown, expressed as a percentage of position margin.
-
-    The drawdown itself is measured in absolute dollar terms as the
-    decline in unrealized PnL from its running daily peak. That dollar
-    figure is then divided by the position margin recorded at the same
+    Compute, for every observed timeslot, the maximum drawdown within
+    the trailing 24-hour window ending at that timeslot. Drawdown is
+    measured in absolute dollar terms as the decline in unrealized PnL
+    from its running peak *within that trailing window only* (the peak
+    is not carried over from outside the window). That dollar figure
+    is then divided by the position margin recorded at the same
     timeslot, per the relationship:
 
         drawdown_pct = abs_dollar_drawdown / position_margin_at_trough
@@ -756,31 +782,46 @@ def extract_daily_drawdowns(
     unrelated to trading losses (manual top-ups, leverage changes,
     position resizing), so using it as the numerator produces drawdown
     percentages with no reliable relationship to actual dollar losses.
+
+    Unlike a fixed-calendar-day partition, this window is anchored to
+    each individual timeslot and looks back exactly
+    ROLLING_WINDOW_SECONDS, so it does not reset at a fixed UTC
+    boundary.
+
+    Returns a list of (timeslot, rolling_drawdown_pct) pairs, one per
+    input observation, sorted by timeslot.
     """
 
     if not series:
         return []
 
-    days: Dict[int, List[Tuple[float, float]]] = {}
+    # series is already sorted by timeslot (guaranteed by
+    # extract_margin_series), which allows a two-pointer sliding
+    # window rather than an O(n^2) rescan per timeslot.
 
-    for t, unrealized, margin in series:
-        dt = datetime.fromtimestamp(t)
-        midnight = int(
-            datetime(dt.year, dt.month, dt.day).timestamp()
-        )
-        if midnight not in days:
-            days[midnight] = []
-        days[midnight].append((unrealized, margin))
+    rolling: List[Tuple[int, float]] = []
 
-    drawdowns: List[Tuple[int, float]] = []
+    window_start_idx = 0
+    n = len(series)
 
-    for midnight in sorted(days.keys()):
-        values = days[midnight]
+    for i in range(n):
+        current_time = series[i][0]
+        window_floor = current_time - ROLLING_WINDOW_SECONDS
 
-        running_peak_pnl = values[0][0]
+        # Advance the window's left edge past any observation now
+        # older than the trailing 24-hour cutoff for this timeslot.
+        while (
+            window_start_idx < i
+            and series[window_start_idx][0] < window_floor
+        ):
+            window_start_idx += 1
+
+        window_slice = series[window_start_idx: i + 1]
+
+        running_peak_pnl = window_slice[0][1]
         max_dd_pct = 0.0
 
-        for unrealized, margin in values:
+        for _, unrealized, margin in window_slice:
             if unrealized > running_peak_pnl:
                 running_peak_pnl = unrealized
 
@@ -791,9 +832,35 @@ def extract_daily_drawdowns(
                 if dd_pct > max_dd_pct:
                     max_dd_pct = dd_pct
 
-        drawdowns.append((midnight, max_dd_pct))
+        rolling.append((current_time, max_dd_pct))
 
-    return drawdowns
+    return rolling
+
+
+def bucket_rolling_drawdowns_by_day(
+    rolling: List[Tuple[int, float]],
+) -> List[Tuple[int, float]]:
+    """
+    Group the per-observation rolling 24-hour drawdown series by UTC
+    calendar day, taking the maximum rolling drawdown value observed
+    at any point during that day as the day's bar height.
+
+    Returns (utc_midnight_timeslot, max_rolling_dd_pct) pairs, one per
+    UTC calendar day present in the data, sorted by day.
+    """
+
+    if not rolling:
+        return []
+
+    days: Dict[int, float] = {}
+
+    for t, dd in rolling:
+        midnight = utc_midnight(t)
+
+        if midnight not in days or dd > days[midnight]:
+            days[midnight] = dd
+
+    return sorted(days.items(), key=lambda pair: pair[0])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -821,16 +888,14 @@ def check_var_alert(
     return exceedances >= VAR_ALERT_COUNT
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# SVG DRAWDOWN CHART
-# ─────────────────────────────────────────────────────────────────────────────
-
 def build_drawdown_chart_svg(
     drawdowns: List[Tuple[int, float]],
 ) -> str:
     """
-    Render a square (1:1) SVG bar chart of daily drawdowns, expressed as
-    absolute-dollar PnL decline relative to position margin.
+    Render a square (1:1) SVG bar chart of daily bars, where each bar's
+    height is the maximum trailing-24-hour rolling drawdown observed
+    during that UTC calendar day, expressed as absolute-dollar PnL
+    decline relative to position margin.
     The y-axis marks the 99% VAR at 62.0%. Bars above 62.0% are colored red.
 
     Bar geometry:
@@ -856,6 +921,8 @@ def build_drawdown_chart_svg(
         (including the very first day of the dataset) is labeled with
         the first three letters of that month's name instead of its
         numeral, marking the month threshold.
+
+    All day boundaries and labels are computed in UTC.
     """
 
     if not drawdowns:
@@ -985,7 +1052,7 @@ def build_drawdown_chart_svg(
     seen_months = set()
 
     for t, _ in drawdowns:
-        dt = datetime.fromtimestamp(t)
+        dt = utc_dt(t)
         month_key = (dt.year, dt.month)
 
         x = x_for_bar(t) + (drawn_bar_width / 2.0)
@@ -1017,7 +1084,7 @@ def build_drawdown_chart_svg(
 
         f'<text x="{size / 2:.2f}" y="18" text-anchor="middle" '
         'font-size="14" font-family="monospace" font-weight="bold" '
-        'fill="#111111">Unrealized PnL Daily Drawdown &amp; 99% VAR</text>',
+        'fill="#111111">Rolling 24h Drawdown &amp; 99% VAR (UTC)</text>',
 
         *bar_elements,
         *y_axis_elements,
@@ -1184,9 +1251,12 @@ def build_output_html(
     equity_series = extract_equity_series()
     chart_svg = build_equity_chart_svg(equity_series)
 
-    # Use unrealized PnL relative to position margin for the drawdown chart
+    # Use unrealized PnL relative to position margin for the drawdown chart,
+    # computed as a rolling trailing-24-hour window rather than a fixed
+    # calendar-day reset, then bucketed to one bar per UTC calendar day.
     margin_series = extract_margin_series()
-    daily_drawdowns = extract_daily_drawdowns(margin_series)
+    rolling_drawdowns = extract_rolling_drawdowns(margin_series)
+    daily_drawdowns = bucket_rolling_drawdowns_by_day(rolling_drawdowns)
 
     global var_alert
     var_alert = check_var_alert(daily_drawdowns)
