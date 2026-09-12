@@ -589,7 +589,7 @@ def extract_margin_series() -> List[Tuple[int, float, float]]:
     Extract (timeslot, unrealized_pnl, position_margin) triples from
     historical data. These are used to calculate a dollar-denominated
     drawdown expressed as a percentage of the capital placed at risk
-    (position margin) at that same point in time.
+    (position margin) at the same observation.
     """
     series: List[Tuple[int, float, float]] = []
 
@@ -891,16 +891,24 @@ def extract_rolling_drawdowns(
     the trailing 24-hour window ending at that timeslot. Drawdown is
     measured in absolute dollar terms as the decline in unrealized PnL
     from its running peak *within that trailing window only* (the peak
-    is not carried over from outside the window). That dollar figure
-    is then divided by the position margin recorded at the same
-    timeslot, per the relationship:
+    is not carried over from outside the window).
 
-        drawdown_pct = abs_dollar_drawdown / position_margin_at_trough
+    To keep the drawdown chart on the same scale as the PnL chart,
+    the dollar decline is divided by the position margin recorded at
+    the same observation as the running peak -- i.e. the margin
+    associated with the PnL value that formed the peak:
 
-    This is the same normalization used by the primary PnL chart, so
-    the two charts share a common scale: a $20 decline on $100 of
-    margin reads as 20%, while the same $20 decline on $500 of margin
-    reads as only 4%.
+        drawdown_pct = abs_dollar_drawdown / margin_at_peak * 100
+
+    This is the same normalization used by the primary PnL chart,
+    which divides each observation's PnL by that same observation's
+    margin. Using margin at the trough instead would produce a value
+    that could not be compared like-for-like against chart 1 whenever
+    margin changed between peak and trough (top-up, resize, leverage
+    change). Anchoring to the peak observation's margin keeps both
+    charts answering the same question: "how large is this move
+    relative to the capital that was in play when the move was
+    measured from?"
 
     Unlike a fixed-calendar-day partition, this window is anchored to
     each individual timeslot and looks back exactly
@@ -937,17 +945,27 @@ def extract_rolling_drawdowns(
 
         window_slice = series[window_start_idx: i + 1]
 
+        # Track the peak PnL together with the margin recorded at the
+        # same observation, since that is the denominator for the
+        # drawdown percentage.
         running_peak_pnl = window_slice[0][1]
+        running_peak_margin = window_slice[0][2]
         max_dd_pct = 0.0
 
         for _, unrealized, margin in window_slice:
             if unrealized > running_peak_pnl:
                 running_peak_pnl = unrealized
+                running_peak_margin = margin
 
             abs_dollar_drawdown = running_peak_pnl - unrealized
 
-            if margin > 0:
-                dd_pct = (abs_dollar_drawdown / margin) * 100.0
+            # Divide by margin at the peak observation, matching the
+            # normalization used by the primary PnL chart.
+            if running_peak_margin > 0:
+                dd_pct = (
+                    abs_dollar_drawdown / running_peak_margin
+                ) * 100.0
+
                 if dd_pct > max_dd_pct:
                     max_dd_pct = dd_pct
 
@@ -1014,7 +1032,7 @@ def build_drawdown_chart_svg(
     Render a square (1:1) SVG bar chart of daily bars, where each bar's
     height is the maximum trailing-24-hour rolling drawdown observed
     during that UTC calendar day, expressed as absolute-dollar PnL
-    decline relative to position margin.
+    decline relative to the position margin at the peak observation.
     The y-axis marks the 99% VAR at 62.0%. Bars above 62.0% are colored red.
 
     Bar geometry:
@@ -1375,6 +1393,8 @@ def build_output_html(
     # Use unrealized PnL relative to position margin for the drawdown chart,
     # computed as a rolling trailing-24-hour window rather than a fixed
     # calendar-day reset, then bucketed to one bar per UTC calendar day.
+    # The denominator is the margin at the peak observation, matching
+    # the normalization used by the PnL chart above.
     margin_series = extract_margin_series()
     rolling_drawdowns = extract_rolling_drawdowns(margin_series)
     daily_drawdowns = bucket_rolling_drawdowns_by_day(rolling_drawdowns)
