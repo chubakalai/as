@@ -47,6 +47,14 @@ VAR_THRESHOLD_PCT = 62.0
 VAR_ALERT_COUNT = 4
 VAR_ALERT_WINDOW_DAYS = 30
 
+# Minimum pixel spacing required between x-axis hour labels on the equity
+# chart. If labeling every hour would place labels closer together than
+# this, the chart falls back to labeling every 4th or 12th hour instead.
+MIN_HOUR_LABEL_SPACING_PX = 34.0
+
+# Candidate hour-label strides, tried in ascending order until one fits.
+HOUR_LABEL_STRIDE_CANDIDATES = (1, 2, 4, 12)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # .ENV LOADER
@@ -478,9 +486,12 @@ def build_headline(
 # SERIES EXTRACTION
 # ─────────────────────────────────────────────────────────────────────────────
 
-def extract_equity_series() -> List[Tuple[int, float]]:
+def extract_pnl_series() -> List[Tuple[int, float]]:
     """
-    Extract (timeslot, equity) pairs from historical data.
+    Extract (timeslot, unrealized PnL) pairs from historical data.
+
+    This replaces the previous equity-based series so the primary
+    chart plots margin/PnL rather than equity.
     """
     series: List[Tuple[int, float]] = []
 
@@ -517,15 +528,15 @@ def extract_equity_series() -> List[Tuple[int, float]]:
         if usdt_account is None:
             continue
 
-        equity = get_number(
+        unrealized = get_number(
             usdt_account,
-            "equity",
+            "unrealized",
         )
 
-        if equity is None:
+        if unrealized is None:
             continue
 
-        series.append((timeslot, equity))
+        series.append((timeslot, unrealized))
 
     series.sort(key=lambda pair: pair[0])
 
@@ -595,25 +606,55 @@ def extract_margin_series() -> List[Tuple[int, float, float]]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SVG EQUITY CHART
+# SVG PNL / MARGIN CHART
 # ─────────────────────────────────────────────────────────────────────────────
 
-def build_equity_chart_svg(
+def choose_hour_label_stride(
+    min_time: int,
+    max_time: int,
+    plot_width: float,
+) -> int:
+    """
+    Pick the smallest hour-label stride from
+    HOUR_LABEL_STRIDE_CANDIDATES such that consecutive labels are at
+    least MIN_HOUR_LABEL_SPACING_PX apart on screen. Falls back to the
+    largest candidate if none of them satisfy the spacing requirement.
+    """
+
+    time_span = max_time - min_time
+
+    if time_span <= 0:
+        return HOUR_LABEL_STRIDE_CANDIDATES[0]
+
+    pixels_per_second = plot_width / time_span
+
+    for stride in HOUR_LABEL_STRIDE_CANDIDATES:
+        seconds_between_labels = stride * 3600
+        spacing_px = seconds_between_labels * pixels_per_second
+
+        if spacing_px >= MIN_HOUR_LABEL_SPACING_PX:
+            return stride
+
+    return HOUR_LABEL_STRIDE_CANDIDATES[-1]
+
+
+def build_pnl_chart_svg(
     series: List[Tuple[int, float]],
 ) -> str:
     """
-    Render a square (1:1) SVG line chart of equity over time.
+    Render a square (1:1) SVG line chart of unrealized PnL over time,
+    replacing the previous equity chart.
 
-    The x-axis marks every UTC hour boundary with a bare hour-of-day
-    number (00-23). At the specific hour mark where a new UTC calendar
-    day begins, the "00" label is followed by a second line beneath it
-    showing the day and month of that new day in dd.mm format
-    (e.g., "10.09"). All other hour marks show only their single-line
-    hh label, unchanged.
+    The x-axis marks hour boundaries with a bare hour-of-day number
+    (00-23), but the labeling stride adapts to the data density so
+    labels never overlap: every hour when the span is short, otherwise
+    every 2, 4, or 12 hours. At the specific hour mark where a new UTC
+    calendar day begins, the hour label is followed by a second line
+    beneath it showing the day and month of that new day in dd.mm
+    format (e.g., "10.09").
 
-    Dashed reference/gridlines (both the horizontal min/max lines and
-    the vertical per-hour gridlines) have been removed; only the solid
-    axis lines, solid tick marks, and text labels remain.
+    Dashed reference/gridlines have been removed; only the solid axis
+    lines, solid tick marks, and text labels remain.
     """
 
     if len(series) < 2:
@@ -635,34 +676,34 @@ def build_equity_chart_svg(
     plot_height = plot_bottom - plot_top
 
     timeslots = [pair[0] for pair in series]
-    equities = [pair[1] for pair in series]
+    values = [pair[1] for pair in series]
 
     min_time = min(timeslots)
     max_time = max(timeslots)
 
-    min_equity = min(equities)
-    max_equity = max(equities)
+    min_value = min(values)
+    max_value = max(values)
 
     time_span = max_time - min_time
-    equity_span = max_equity - min_equity
+    value_span = max_value - min_value
 
     if time_span == 0:
         time_span = 1
 
-    if equity_span == 0:
-        equity_span = 1
+    if value_span == 0:
+        value_span = 1
 
     def x_for(timeslot: int) -> float:
         fraction = (timeslot - min_time) / time_span
         return plot_left + fraction * plot_width
 
-    def y_for(equity: float) -> float:
-        fraction = (equity - min_equity) / equity_span
+    def y_for(value: float) -> float:
+        fraction = (value - min_value) / value_span
         return plot_bottom - fraction * plot_height
 
     points_attr = " ".join(
-        f"{x_for(t):.2f},{y_for(e):.2f}"
-        for t, e in series
+        f"{x_for(t):.2f},{y_for(v):.2f}"
+        for t, v in series
     )
 
     y_axis_elements = [
@@ -672,11 +713,11 @@ def build_equity_chart_svg(
 
         f'<text x="{plot_left - 8}" y="{plot_top + 4}" '
         'text-anchor="end" font-size="12" font-family="monospace" '
-        f'fill="#333333">{format_number(max_equity)}</text>',
+        f'fill="#333333">{format_number(max_value)}</text>',
 
         f'<text x="{plot_left - 8}" y="{plot_bottom + 4}" '
         'text-anchor="end" font-size="12" font-family="monospace" '
-        f'fill="#333333">{format_number(min_equity)}</text>',
+        f'fill="#333333">{format_number(min_value)}</text>',
     ]
 
     x_axis_elements = [
@@ -687,11 +728,20 @@ def build_equity_chart_svg(
 
     seconds_per_hour = 3600
 
-    first_hour_mark = (
-        (min_time // seconds_per_hour) + 1
-    ) * seconds_per_hour
+    # Adaptive labeling stride so hour labels never overlap.
+    hour_stride = choose_hour_label_stride(
+        min_time,
+        max_time,
+        plot_width,
+    )
 
-    if min_time % seconds_per_hour == 0:
+    stride_seconds = hour_stride * seconds_per_hour
+
+    first_hour_mark = (
+        (min_time // stride_seconds) + 1
+    ) * stride_seconds
+
+    if min_time % stride_seconds == 0:
         first_hour_mark = min_time
 
     hour_mark = first_hour_mark
@@ -733,24 +783,24 @@ def build_equity_chart_svg(
                 f'font-family="monospace" fill="#333333">{label}</text>'
             )
 
-        hour_mark += seconds_per_hour
+        hour_mark += stride_seconds
 
     point_elements = [
-        f'<circle cx="{x_for(t):.2f}" cy="{y_for(e):.2f}" r="2.5" '
+        f'<circle cx="{x_for(t):.2f}" cy="{y_for(v):.2f}" r="2.5" '
         'fill="#1a73e8" />'
-        for t, e in series
+        for t, v in series
     ]
 
     svg_parts = [
         f'<svg viewBox="0 0 {size} {size}" width="{size}" height="{size}" '
         'xmlns="http://www.w3.org/2000/svg" role="img" '
-        'aria-label="Equity over time">',
+        'aria-label="Unrealized PnL over time">',
 
         f'<rect x="0" y="0" width="{size}" height="{size}" fill="#ffffff" />',
 
         f'<text x="{size / 2:.2f}" y="18" text-anchor="middle" '
         'font-size="14" font-family="monospace" font-weight="bold" '
-        'fill="#111111">Equity Over Time (UTC)</text>',
+        'fill="#111111">Unrealized PnL Over Time (UTC)</text>',
 
         *y_axis_elements,
         *x_axis_elements,
@@ -1255,8 +1305,9 @@ def build_output_html(
     if DEBUG:
         text_block += build_debug_block()
 
-    equity_series = extract_equity_series()
-    chart_svg = build_equity_chart_svg(equity_series)
+    # Plot unrealized PnL / margin instead of equity.
+    pnl_series = extract_pnl_series()
+    chart_svg = build_pnl_chart_svg(pnl_series)
 
     # Use unrealized PnL relative to position margin for the drawdown chart,
     # computed as a rolling trailing-24-hour window rather than a fixed
