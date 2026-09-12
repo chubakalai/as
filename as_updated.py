@@ -47,9 +47,9 @@ VAR_THRESHOLD_PCT = 62.0
 VAR_ALERT_COUNT = 4
 VAR_ALERT_WINDOW_DAYS = 30
 
-# Minimum pixel spacing required between x-axis hour labels on the equity
+# Minimum pixel spacing required between x-axis hour labels on the PnL
 # chart. If labeling every hour would place labels closer together than
-# this, the chart falls back to labeling every 4th or 12th hour instead.
+# this, the chart falls back to labeling every 2, 4, or 12 hours instead.
 MIN_HOUR_LABEL_SPACING_PX = 34.0
 
 # Candidate hour-label strides, tried in ascending order until one fits.
@@ -416,6 +416,16 @@ def format_number(
     return f"{value:.2f}"
 
 
+def format_pct(
+    value: Optional[float],
+) -> str:
+
+    if value is None:
+        return "N/A"
+
+    return f"{value:.2f}%"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # HEADLINE / REPORTED VALUES
 # ─────────────────────────────────────────────────────────────────────────────
@@ -429,7 +439,7 @@ def build_headline(
         return "Status: UNAVAILABLE\n"
 
     # ─────────────────────────────────────────────────────────────────────────
-    # Five reported variables
+    # Reported variables
     # ─────────────────────────────────────────────────────────────────────────
 
     equity = get_number(
@@ -462,6 +472,20 @@ def build_headline(
         "positionMargin",
     )
 
+    # PnL expressed as a percentage of the capital placed at risk
+    # (position margin). This makes the dollar figure interpretable:
+    # $20 on $100 margin is 20%, while $20 on $500 margin is only 4%.
+    pnl_pct = None
+
+    if (
+        unrealized is not None
+        and position_margin is not None
+        and position_margin > 0
+    ):
+        pnl_pct = (
+            unrealized / position_margin
+        ) * 100.0
+
     last_updated = utc_dt(current_time).strftime(
         "%Y-%m-%d %H:%M:%S"
     ) + " UTC"
@@ -472,7 +496,8 @@ def build_headline(
         f"Equity:           "
         f"{format_number(equity)}\n"
         f"Unrealized P&L:   "
-        f"{format_number(unrealized)}\n"
+        f"{format_number(unrealized)}  "
+        f"({format_pct(pnl_pct)} of margin)\n"
         f"Wallet Balance:   "
         f"{format_number(wallet_balance)}\n"
         f"Available Margin: "
@@ -486,12 +511,16 @@ def build_headline(
 # SERIES EXTRACTION
 # ─────────────────────────────────────────────────────────────────────────────
 
-def extract_pnl_series() -> List[Tuple[int, float]]:
+def extract_pnl_pct_series() -> List[Tuple[int, float]]:
     """
-    Extract (timeslot, unrealized PnL) pairs from historical data.
+    Extract (timeslot, unrealized PnL as a percentage of position
+    margin) pairs from historical data.
 
-    This replaces the previous equity-based series so the primary
-    chart plots margin/PnL rather than equity.
+    The dollar PnL alone is not interpretable without knowing how much
+    capital was placed at risk. Expressing it relative to position
+    margin normalizes across position sizes and leverage: $20 of PnL
+    on $100 margin is +20%, while the same $20 on $500 margin is only
+    +4%. This ratio is the quantity plotted on the primary chart.
     """
     series: List[Tuple[int, float]] = []
 
@@ -533,10 +562,22 @@ def extract_pnl_series() -> List[Tuple[int, float]]:
             "unrealized",
         )
 
-        if unrealized is None:
+        margin = get_number(
+            usdt_account,
+            "positionMargin",
+        )
+
+        if unrealized is None or margin is None:
             continue
 
-        series.append((timeslot, unrealized))
+        if margin <= 0:
+            continue
+
+        pnl_pct = (
+            unrealized / margin
+        ) * 100.0
+
+        series.append((timeslot, pnl_pct))
 
     series.sort(key=lambda pair: pair[0])
 
@@ -606,7 +647,7 @@ def extract_margin_series() -> List[Tuple[int, float, float]]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SVG PNL / MARGIN CHART
+# SVG PNL-AS-%-OF-MARGIN CHART
 # ─────────────────────────────────────────────────────────────────────────────
 
 def choose_hour_label_stride(
@@ -642,8 +683,14 @@ def build_pnl_chart_svg(
     series: List[Tuple[int, float]],
 ) -> str:
     """
-    Render a square (1:1) SVG line chart of unrealized PnL over time,
-    replacing the previous equity chart.
+    Render a square (1:1) SVG line chart of unrealized PnL expressed
+    as a percentage of position margin over time.
+
+    Plotting PnL relative to margin rather than as a raw dollar figure
+    makes the series interpretable regardless of position size: the
+    same $20 gain reads as +20% on $100 of margin but only +4% on
+    $500 of margin. A zero baseline is drawn so gains and losses are
+    visually separated.
 
     The x-axis marks hour boundaries with a bare hour-of-day number
     (00-23), but the labeling stride adapts to the data density so
@@ -654,7 +701,7 @@ def build_pnl_chart_svg(
     format (e.g., "10.09").
 
     Dashed reference/gridlines have been removed; only the solid axis
-    lines, solid tick marks, and text labels remain.
+    lines, solid tick marks, the zero baseline, and text labels remain.
     """
 
     if len(series) < 2:
@@ -684,6 +731,11 @@ def build_pnl_chart_svg(
     min_value = min(values)
     max_value = max(values)
 
+    # Always include the zero baseline so profit and loss are visually
+    # separated, even if all observations share the same sign.
+    min_value = min(min_value, 0.0)
+    max_value = max(max_value, 0.0)
+
     time_span = max_time - min_time
     value_span = max_value - min_value
 
@@ -706,18 +758,29 @@ def build_pnl_chart_svg(
         for t, v in series
     )
 
+    zero_y = y_for(0.0)
+
     y_axis_elements = [
         f'<line x1="{plot_left}" y1="{plot_top}" '
         f'x2="{plot_left}" y2="{plot_bottom}" '
         'stroke="#333333" stroke-width="1.5" />',
 
+        # Zero baseline: gains above, losses below.
+        f'<line x1="{plot_left}" y1="{zero_y:.2f}" '
+        f'x2="{plot_right}" y2="{zero_y:.2f}" '
+        'stroke="#999999" stroke-width="1" />',
+
         f'<text x="{plot_left - 8}" y="{plot_top + 4}" '
         'text-anchor="end" font-size="12" font-family="monospace" '
-        f'fill="#333333">{format_number(max_value)}</text>',
+        f'fill="#333333">{format_pct(max_value)}</text>',
 
         f'<text x="{plot_left - 8}" y="{plot_bottom + 4}" '
         'text-anchor="end" font-size="12" font-family="monospace" '
-        f'fill="#333333">{format_number(min_value)}</text>',
+        f'fill="#333333">{format_pct(min_value)}</text>',
+
+        f'<text x="{plot_left - 8}" y="{zero_y + 4:.2f}" '
+        'text-anchor="end" font-size="11" font-family="monospace" '
+        'fill="#999999">0%</text>',
     ]
 
     x_axis_elements = [
@@ -794,13 +857,13 @@ def build_pnl_chart_svg(
     svg_parts = [
         f'<svg viewBox="0 0 {size} {size}" width="{size}" height="{size}" '
         'xmlns="http://www.w3.org/2000/svg" role="img" '
-        'aria-label="Unrealized PnL over time">',
+        'aria-label="Unrealized PnL as percent of margin over time">',
 
         f'<rect x="0" y="0" width="{size}" height="{size}" fill="#ffffff" />',
 
         f'<text x="{size / 2:.2f}" y="18" text-anchor="middle" '
         'font-size="14" font-family="monospace" font-weight="bold" '
-        'fill="#111111">Unrealized PnL Over Time (UTC)</text>',
+        'fill="#111111">Unrealized PnL / Position Margin (UTC)</text>',
 
         *y_axis_elements,
         *x_axis_elements,
@@ -834,11 +897,10 @@ def extract_rolling_drawdowns(
 
         drawdown_pct = abs_dollar_drawdown / position_margin_at_trough
 
-    This differs from an approach that measures the percentage decline
-    of position margin itself. Position margin can change for reasons
-    unrelated to trading losses (manual top-ups, leverage changes,
-    position resizing), so using it as the numerator produces drawdown
-    percentages with no reliable relationship to actual dollar losses.
+    This is the same normalization used by the primary PnL chart, so
+    the two charts share a common scale: a $20 decline on $100 of
+    margin reads as 20%, while the same $20 decline on $500 of margin
+    reads as only 4%.
 
     Unlike a fixed-calendar-day partition, this window is anchored to
     each individual timeslot and looks back exactly
@@ -1305,9 +1367,10 @@ def build_output_html(
     if DEBUG:
         text_block += build_debug_block()
 
-    # Plot unrealized PnL / margin instead of equity.
-    pnl_series = extract_pnl_series()
-    chart_svg = build_pnl_chart_svg(pnl_series)
+    # Plot unrealized PnL relative to position margin, so the series is
+    # interpretable across different position sizes and leverage.
+    pnl_pct_series = extract_pnl_pct_series()
+    chart_svg = build_pnl_chart_svg(pnl_pct_series)
 
     # Use unrealized PnL relative to position margin for the drawdown chart,
     # computed as a rolling trailing-24-hour window rather than a fixed
