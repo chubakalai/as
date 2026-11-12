@@ -10,6 +10,11 @@ import urllib.request
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
+try:
+    import resource  # Unix only; used for memory logging
+except ImportError:  # pragma: no cover
+    resource = None
+
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIGURATION
 # ─────────────────────────────────────────────────────────────────────────────
@@ -34,6 +39,11 @@ CHART_MARGIN_LEFT = 70
 CHART_MARGIN_RIGHT = 30
 CHART_MARGIN_TOP = 30
 CHART_MARGIN_BOTTOM = 60
+
+# Maximum number of points drawn on the PnL chart. Longer series are
+# evenly downsampled (first and last points are always kept). Min/max
+# for the axes are still computed from the full series.
+MAX_CHART_POINTS = 500
 
 # Drawdown chart bar-geometry configuration
 DRAWDOWN_MIN_SCOPE_DAYS = 30
@@ -111,8 +121,9 @@ logging.basicConfig(
 latest_text = "Initializing...\n"
 text_lock = threading.Lock()
 
-# Historical data storage
-history_data: List[Dict[str, Any]] = []
+# Compact in-memory history: (timeslot, unrealized_pnl, position_margin).
+# The full raw API responses live only in the JSONL file on disk.
+history_data: List[Tuple[int, float, float]] = []
 history_lock = threading.Lock()
 
 # Boolean VAR alert flag.
@@ -152,15 +163,125 @@ def utc_midnight(timeslot: float) -> int:
     return int(midnight.timestamp())
 
 
+def log_memory(context: str) -> None:
+    """Log peak RSS and history size, to verify memory stays flat."""
+    if resource is None:
+        return
+
+    try:
+        # ru_maxrss is KB on Linux.
+        peak_mb = resource.getrusage(
+            resource.RUSAGE_SELF
+        ).ru_maxrss / 1024.0
+
+        logging.info(
+            "[mem] %s: peak_rss=%.1f MB, history_records=%d",
+            context,
+            peak_mb,
+            len(history_data),
+        )
+    except Exception:
+        pass
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NUMBER HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def get_number(
+    account: Dict[str, Any],
+    field: str,
+) -> Optional[float]:
+
+    value = account.get(field)
+
+    if value is None:
+        return None
+
+    try:
+        return float(value)
+
+    except (TypeError, ValueError):
+        return None
+
+
+def format_number(
+    value: Optional[float],
+) -> str:
+
+    if value is None:
+        return "N/A"
+
+    return f"{value:.2f}"
+
+
+def format_pct(
+    value: Optional[float],
+) -> str:
+
+    if value is None:
+        return "N/A"
+
+    return f"{value:.2f}%"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # HISTORY MANAGEMENT
 # ─────────────────────────────────────────────────────────────────────────────
 
+def compact_record(
+    record: Dict[str, Any],
+) -> Optional[Tuple[int, float, float]]:
+    """
+    Reduce a full history record to (timeslot, unrealized, margin).
+    Returns None if the record lacks a usable USDT account.
+    """
+
+    if not isinstance(record, dict):
+        return None
+
+    timeslot = record.get("timeslot")
+    raw_response = record.get("raw_response")
+
+    if not isinstance(timeslot, int):
+        return None
+
+    if not isinstance(raw_response, dict):
+        return None
+
+    data = raw_response.get("data")
+
+    if not isinstance(data, list):
+        return None
+
+    for account in data:
+        if (
+            isinstance(account, dict)
+            and str(
+                account.get("currency", "")
+            ).upper() == "USDT"
+        ):
+            unrealized = get_number(account, "unrealized")
+            margin = get_number(account, "positionMargin")
+
+            if unrealized is None or margin is None:
+                return None
+
+            return (timeslot, unrealized, margin)
+
+    return None
+
+
 def load_history() -> None:
-    """Load existing history from the JSONL file into memory."""
+    """
+    Stream the JSONL history file into memory, keeping only the compact
+    (timeslot, unrealized, margin) tuple for each record.
+    """
 
     if not os.path.exists(HISTORY_FILE):
         return
+
+    skipped = 0
 
     try:
         with open(HISTORY_FILE, "r", encoding="utf-8") as f:
@@ -170,12 +291,22 @@ def load_history() -> None:
                 if not line:
                     continue
 
-                record = json.loads(line)
-                history_data.append(record)
+                try:
+                    entry = compact_record(json.loads(line))
+
+                except json.JSONDecodeError:
+                    # Tolerate a truncated/corrupt line (e.g. after a
+                    # crash) instead of dropping everything after it.
+                    skipped += 1
+                    continue
+
+                if entry is not None:
+                    history_data.append(entry)
 
         logging.info(
-            "Loaded %d historical records.",
+            "Loaded %d historical records (%d unreadable lines skipped).",
             len(history_data),
+            skipped,
         )
 
     except Exception as exc:
@@ -190,7 +321,8 @@ def save_to_history(
     raw_response: Dict[str, Any],
 ) -> None:
     """
-    Append a raw API response to the history file.
+    Append a raw API response to the history file, and keep only the
+    compact tuple in memory.
 
     This function is only called for completed 15-minute time slots.
     """
@@ -212,7 +344,10 @@ def save_to_history(
                     json.dumps(record) + "\n"
                 )
 
-            history_data.append(record)
+            entry = compact_record(record)
+
+            if entry is not None:
+                history_data.append(entry)
 
             logging.info(
                 "Saved API response for 15-minute boundary %s",
@@ -386,47 +521,6 @@ def fetch_account_assets() -> Tuple[
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DATA FORMATTING
-# ─────────────────────────────────────────────────────────────────────────────
-
-def get_number(
-    account: Dict[str, Any],
-    field: str,
-) -> Optional[float]:
-
-    value = account.get(field)
-
-    if value is None:
-        return None
-
-    try:
-        return float(value)
-
-    except (TypeError, ValueError):
-        return None
-
-
-def format_number(
-    value: Optional[float],
-) -> str:
-
-    if value is None:
-        return "N/A"
-
-    return f"{value:.2f}"
-
-
-def format_pct(
-    value: Optional[float],
-) -> str:
-
-    if value is None:
-        return "N/A"
-
-    return f"{value:.2f}%"
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # HEADLINE / REPORTED VALUES
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -437,10 +531,6 @@ def build_headline(
 
     if account is None:
         return "Status: UNAVAILABLE\n"
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # Reported variables
-    # ─────────────────────────────────────────────────────────────────────────
 
     equity = get_number(
         account,
@@ -511,139 +601,53 @@ def build_headline(
 # SERIES EXTRACTION
 # ─────────────────────────────────────────────────────────────────────────────
 
-def extract_pnl_pct_series() -> List[Tuple[int, float]]:
-    """
-    Extract (timeslot, unrealized PnL as a percentage of position
-    margin) pairs from historical data.
-
-    The dollar PnL alone is not interpretable without knowing how much
-    capital was placed at risk. Expressing it relative to position
-    margin normalizes across position sizes and leverage: $20 of PnL
-    on $100 margin is +20%, while the same $20 on $500 margin is only
-    +4%. This ratio is the quantity plotted on the primary chart.
-    """
-    series: List[Tuple[int, float]] = []
-
-    with history_lock:
-        records = list(history_data)
-
-    for record in records:
-        timeslot = record.get("timeslot")
-        raw_response = record.get("raw_response")
-
-        if not isinstance(timeslot, int):
-            continue
-
-        if not isinstance(raw_response, dict):
-            continue
-
-        data = raw_response.get("data")
-
-        if not isinstance(data, list):
-            continue
-
-        usdt_account = None
-
-        for account in data:
-            if (
-                isinstance(account, dict)
-                and str(
-                    account.get("currency", "")
-                ).upper() == "USDT"
-            ):
-                usdt_account = account
-                break
-
-        if usdt_account is None:
-            continue
-
-        unrealized = get_number(
-            usdt_account,
-            "unrealized",
-        )
-
-        margin = get_number(
-            usdt_account,
-            "positionMargin",
-        )
-
-        if unrealized is None or margin is None:
-            continue
-
-        if margin <= 0:
-            continue
-
-        pnl_pct = (
-            unrealized / margin
-        ) * 100.0
-
-        series.append((timeslot, pnl_pct))
-
-    series.sort(key=lambda pair: pair[0])
-
-    return series
-
-
 def extract_margin_series() -> List[Tuple[int, float, float]]:
     """
-    Extract (timeslot, unrealized_pnl, position_margin) triples from
-    historical data. These are used to calculate a dollar-denominated
-    drawdown expressed as a percentage of the capital placed at risk
-    (position margin) at the same observation.
+    Return (timeslot, unrealized_pnl, position_margin) triples sorted
+    by timeslot. Used for the dollar-denominated drawdown calculation,
+    which is expressed relative to the position margin at the peak.
     """
-    series: List[Tuple[int, float, float]] = []
 
     with history_lock:
-        records = list(history_data)
+        return sorted(history_data, key=lambda r: r[0])
 
-    for record in records:
-        timeslot = record.get("timeslot")
-        raw_response = record.get("raw_response")
 
-        if not isinstance(timeslot, int):
-            continue
+def extract_pnl_pct_series() -> List[Tuple[int, float]]:
+    """
+    Return (timeslot, unrealized PnL as a percentage of position
+    margin) pairs. Normalizing by margin makes the series comparable
+    across position sizes and leverage: $20 on $100 margin is +20%,
+    while the same $20 on $500 margin is only +4%.
+    """
 
-        if not isinstance(raw_response, dict):
-            continue
+    return [
+        (t, (u / m) * 100.0)
+        for t, u, m in extract_margin_series()
+        if m > 0
+    ]
 
-        data = raw_response.get("data")
 
-        if not isinstance(data, list):
-            continue
+def downsample_series(
+    series: List[Tuple[int, float]],
+    max_points: int = MAX_CHART_POINTS,
+) -> List[Tuple[int, float]]:
+    """
+    Evenly thin a series to at most max_points, always keeping the
+    first and last observations.
+    """
 
-        usdt_account = None
+    n = len(series)
 
-        for account in data:
-            if (
-                isinstance(account, dict)
-                and str(
-                    account.get("currency", "")
-                ).upper() == "USDT"
-            ):
-                usdt_account = account
-                break
+    if n <= max_points or max_points < 2:
+        return series
 
-        if usdt_account is None:
-            continue
+    step = (n - 1) / (max_points - 1)
 
-        unrealized = get_number(
-            usdt_account,
-            "unrealized",
-        )
+    indices = sorted(
+        {int(round(i * step)) for i in range(max_points)}
+    )
 
-        margin = get_number(
-            usdt_account,
-            "positionMargin",
-        )
-
-        if unrealized is None or margin is None:
-            continue
-
-        series.append((timeslot, unrealized, margin))
-
-    series.sort(key=lambda triple: triple[0])
-
-    return series
+    return [series[i] for i in indices]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -686,22 +690,14 @@ def build_pnl_chart_svg(
     Render a square (1:1) SVG line chart of unrealized PnL expressed
     as a percentage of position margin over time.
 
-    Plotting PnL relative to margin rather than as a raw dollar figure
-    makes the series interpretable regardless of position size: the
-    same $20 gain reads as +20% on $100 of margin but only +4% on
-    $500 of margin. A zero baseline is drawn so gains and losses are
-    visually separated.
+    A zero baseline is drawn so gains and losses are visually
+    separated. Axis bounds come from the full series; the drawn line
+    and markers are downsampled to at most MAX_CHART_POINTS.
 
     The x-axis marks hour boundaries with a bare hour-of-day number
-    (00-23), but the labeling stride adapts to the data density so
-    labels never overlap: every hour when the span is short, otherwise
-    every 2, 4, or 12 hours. At the specific hour mark where a new UTC
-    calendar day begins, the hour label is followed by a second line
-    beneath it showing the day and month of that new day in dd.mm
-    format (e.g., "10.09").
-
-    Dashed reference/gridlines have been removed; only the solid axis
-    lines, solid tick marks, the zero baseline, and text labels remain.
+    (00-23), with an adaptive stride so labels never overlap. At the
+    hour mark where a new UTC day begins, the date (dd.mm) is shown on
+    a second line beneath the hour label.
     """
 
     if len(series) < 2:
@@ -722,19 +718,20 @@ def build_pnl_chart_svg(
     plot_width = plot_right - plot_left
     plot_height = plot_bottom - plot_top
 
-    timeslots = [pair[0] for pair in series]
-    values = [pair[1] for pair in series]
+    # Axis bounds use the FULL series so no extreme is lost to
+    # downsampling.
+    min_time = series[0][0]
+    max_time = series[-1][0]
 
-    min_time = min(timeslots)
-    max_time = max(timeslots)
-
-    min_value = min(values)
-    max_value = max(values)
+    min_value = min(v for _, v in series)
+    max_value = max(v for _, v in series)
 
     # Always include the zero baseline so profit and loss are visually
     # separated, even if all observations share the same sign.
     min_value = min(min_value, 0.0)
     max_value = max(max_value, 0.0)
+
+    plot_series = downsample_series(series)
 
     time_span = max_time - min_time
     value_span = max_value - min_value
@@ -755,7 +752,7 @@ def build_pnl_chart_svg(
 
     points_attr = " ".join(
         f"{x_for(t):.2f},{y_for(v):.2f}"
-        for t, v in series
+        for t, v in plot_series
     )
 
     zero_y = y_for(0.0)
@@ -851,7 +848,7 @@ def build_pnl_chart_svg(
     point_elements = [
         f'<circle cx="{x_for(t):.2f}" cy="{y_for(v):.2f}" r="2.5" '
         'fill="#1a73e8" />'
-        for t, v in series
+        for t, v in plot_series
     ]
 
     svg_parts = [
@@ -893,8 +890,7 @@ def extract_rolling_drawdowns(
     from its running peak *within that trailing window only* (the peak
     is not carried over from outside the window).
 
-    To keep the drawdown chart on the same scale as the PnL chart,
-    the dollar decline is divided by the position margin recorded at
+    The dollar decline is divided by the position margin recorded at
     the same observation as the running peak -- i.e. the margin
     associated with the PnL value that formed the peak:
 
@@ -902,18 +898,14 @@ def extract_rolling_drawdowns(
 
     This is the same normalization used by the primary PnL chart,
     which divides each observation's PnL by that same observation's
-    margin. Using margin at the trough instead would produce a value
-    that could not be compared like-for-like against chart 1 whenever
-    margin changed between peak and trough (top-up, resize, leverage
-    change). Anchoring to the peak observation's margin keeps both
+    margin. Anchoring to the peak observation's margin keeps both
     charts answering the same question: "how large is this move
     relative to the capital that was in play when the move was
     measured from?"
 
-    Unlike a fixed-calendar-day partition, this window is anchored to
-    each individual timeslot and looks back exactly
-    ROLLING_WINDOW_SECONDS, so it does not reset at a fixed UTC
-    boundary.
+    The window is anchored to each individual timeslot and looks back
+    exactly ROLLING_WINDOW_SECONDS, so it does not reset at a fixed
+    UTC boundary.
 
     Returns a list of (timeslot, rolling_drawdown_pct) pairs, one per
     input observation, sorted by timeslot.
@@ -943,24 +935,23 @@ def extract_rolling_drawdowns(
         ):
             window_start_idx += 1
 
-        window_slice = series[window_start_idx: i + 1]
-
         # Track the peak PnL together with the margin recorded at the
         # same observation, since that is the denominator for the
-        # drawdown percentage.
-        running_peak_pnl = window_slice[0][1]
-        running_peak_margin = window_slice[0][2]
+        # drawdown percentage. Iterate by index to avoid allocating a
+        # new slice for every observation.
+        running_peak_pnl = series[window_start_idx][1]
+        running_peak_margin = series[window_start_idx][2]
         max_dd_pct = 0.0
 
-        for _, unrealized, margin in window_slice:
+        for j in range(window_start_idx, i + 1):
+            _, unrealized, margin = series[j]
+
             if unrealized > running_peak_pnl:
                 running_peak_pnl = unrealized
                 running_peak_margin = margin
 
             abs_dollar_drawdown = running_peak_pnl - unrealized
 
-            # Divide by margin at the peak observation, matching the
-            # normalization used by the primary PnL chart.
             if running_peak_margin > 0:
                 dd_pct = (
                     abs_dollar_drawdown / running_peak_margin
@@ -1041,23 +1032,17 @@ def build_drawdown_chart_svg(
         to match the full span of the data exactly.
       - Each bar's width is fixed at (scope / DRAWDOWN_BARS_PER_SCOPE).
         At the minimum one-month scope, this yields one bar per day.
-        As the scope grows beyond one month (because more than
-        DRAWDOWN_BARS_PER_SCOPE daily observations exist), bar width
-        shrinks proportionally, since it remains pegged at one-thirtieth
-        of the now-larger scope.
-      - Bars are drawn with no inter-bar margin: each bar's rendered
-        width equals its full allotted slot width along the time axis.
-        Corners are square and fill opacity is full, so each bar is a
-        precise rectangle.
+        As the scope grows beyond one month, bar width shrinks
+        proportionally.
+      - Bars are drawn with no inter-bar margin, square corners and full
+        opacity.
 
     X-axis labeling:
       - Every day receives a tick mark and a label.
-      - An ordinary day is labeled with the bare day-of-month number
-        (1, 2, 3, and so on).
-      - The first day encountered within a new calendar month
-        (including the very first day of the dataset) is labeled with
-        the first three letters of that month's name instead of its
-        numeral, marking the month threshold.
+      - An ordinary day is labeled with the bare day-of-month number.
+      - The first day within a new calendar month (including the very
+        first day of the dataset) is labeled with the three-letter month
+        name instead.
 
     All day boundaries and labels are computed in UTC.
     """
@@ -1112,8 +1097,6 @@ def build_drawdown_chart_svg(
         dd_span = 1.0
 
     # Bar width is fixed at one-thirtieth of the current axis scope.
-    # This yields a one-day-wide bar at the one-month minimum scope,
-    # and shrinks proportionally as the scope grows past one month.
     bar_width_seconds = (
         scope_seconds / DRAWDOWN_BARS_PER_SCOPE
     )
@@ -1136,10 +1119,7 @@ def build_drawdown_chart_svg(
         fraction = (dd - min_dd) / dd_span
         return plot_bottom - fraction * plot_height
 
-    # ─────────────────────────────────────────────────────────────────────────
     # Bars
-    # ─────────────────────────────────────────────────────────────────────────
-
     bar_elements = []
 
     for t, dd in drawdowns:
@@ -1158,10 +1138,7 @@ def build_drawdown_chart_svg(
             f'fill="{color}" />'
         )
 
-    # ─────────────────────────────────────────────────────────────────────────
     # Y-axis
-    # ─────────────────────────────────────────────────────────────────────────
-
     y_axis_elements = [
         f'<line x1="{plot_left}" y1="{plot_top}" '
         f'x2="{plot_left}" y2="{plot_bottom}" '
@@ -1176,10 +1153,7 @@ def build_drawdown_chart_svg(
         'fill="#ff4444">62.0%</text>',
     ]
 
-    # ─────────────────────────────────────────────────────────────────────────
     # X-axis
-    # ─────────────────────────────────────────────────────────────────────────
-
     x_axis_elements = [
         f'<line x1="{plot_left}" y1="{plot_bottom}" '
         f'x2="{plot_right}" y2="{plot_bottom}" '
@@ -1264,10 +1238,6 @@ def build_debug_block() -> str:
 
     lines.append("")
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # SELECTED ACCOUNT
-    # ─────────────────────────────────────────────────────────────────────────
-
     lines.append(
         "SELECTED USDT ACCOUNT:"
     )
@@ -1289,10 +1259,6 @@ def build_debug_block() -> str:
         )
 
     lines.append("")
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # ACCOUNT FIELDS
-    # ─────────────────────────────────────────────────────────────────────────
 
     if selected is not None:
 
@@ -1321,10 +1287,6 @@ def build_debug_block() -> str:
             )
 
         lines.append("")
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # RAW API RESPONSE
-    # ─────────────────────────────────────────────────────────────────────────
 
     lines.append(
         "COMPLETE RAW API RESPONSE:"
@@ -1390,11 +1352,9 @@ def build_output_html(
     pnl_pct_series = extract_pnl_pct_series()
     chart_svg = build_pnl_chart_svg(pnl_pct_series)
 
-    # Use unrealized PnL relative to position margin for the drawdown chart,
-    # computed as a rolling trailing-24-hour window rather than a fixed
-    # calendar-day reset, then bucketed to one bar per UTC calendar day.
-    # The denominator is the margin at the peak observation, matching
-    # the normalization used by the PnL chart above.
+    # Rolling trailing-24-hour drawdown, bucketed to one bar per UTC
+    # calendar day. The denominator is the margin at the peak
+    # observation, matching the normalization used by the PnL chart.
     margin_series = extract_margin_series()
     rolling_drawdowns = extract_rolling_drawdowns(margin_series)
     daily_drawdowns = bucket_rolling_drawdowns_by_day(rolling_drawdowns)
@@ -1495,6 +1455,8 @@ def refresh_account(
     with text_lock:
         latest_text = output
 
+    log_memory("after refresh")
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 15-MINUTE MONITORING LOOP
@@ -1593,6 +1555,7 @@ class RequestHandler(
 if __name__ == "__main__":
 
     load_history()
+    log_memory("after load_history")
 
     refresh_account(
         save_to_history_file=False,
